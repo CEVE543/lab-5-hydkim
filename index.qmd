@@ -1,0 +1,945 @@
+---
+title: "CEVE 543 Fall 2025 Lab 5: Regional vs Local Parameter Estimation"
+subtitle: "Single-station vs regional models, Trend estimation, Uncertainty quantification"
+author: CEVE 543 Fall 2025
+date: "2025-09-26"
+type: "lab"
+module: 1
+week: 5
+objectives:
+  - "Compare single-station vs regional parameter estimation approaches"
+  - "Understand bias-variance trade-offs in regional frequency analysis"
+  - "Quantify uncertainty reduction from regional parameter sharing"
+ps_connection: "Provides regional modeling approaches for PS1 Task 5"
+
+engine: julia
+
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-block-bg: "#f8f8f8"
+    code-block-border-left: "#e1e4e5"
+    theme: simplex
+    number-sections: true
+    fig-format: svg
+  typst:
+    fontsize: 11pt
+    margin: 
+      x: 1in
+      y: 1in
+    number-sections: true
+    fig-format: svg
+
+execute: 
+  cache: true
+  freeze: auto
+
+# Code formatting options
+code-overflow: wrap
+code-line-numbers: false
+code-block-font-size: "0.85em"
+---
+
+## Do Before Lab {.unnumbered}
+
+1. **Accept the assignment.** Use the GitHub Classroom link posted on Canvas to "accept" the assignment, which will give you your own GitHub repository.
+2. **Clone your repository** to your computer using GitHub Desktop or the command line.
+3. **Open the repository in VS Code** directly from VS Code, GitHub Desktop, or your command line.
+4. **Activate the Julia environment.** In VS Code, open the command palette (View → Command Palette) and type "Julia: Start REPL". Alternatively, run `julia --project=.` in the terminal, then run `using Pkg; Pkg.instantiate()` to install required packages. The easiest method is to type `]` in the REPL to enter package mode, then type `instantiate`.
+5. **Review previous concepts** including Bayesian GEV inference, return level calculations, and multi-station comparisons.
+6. **Verify rendering works.** Run `quarto render index.qmd` in your terminal - it should create both PDF and HTML documents.
+
+## Do During Lab {.unnumbered}
+
+This lab explores why regional analysis is essential for reliable extreme value analysis:
+
+1. Individual station trend tests give inconsistent, implausible results
+2. Single-station nonstationary models have excessive uncertainty
+3. Regional models that share some parameters across stations can reduce uncertainty
+4. Comparing approaches reveals bias-variance trade-offs in parameter estimation
+
+As with previous labs, you do not need to write code from scratch -- focus on understanding the regional analysis workflow, interpreting results, and connecting to PS1.
+
+To submit your work, push your changes to GitHub, render to PDF, and upload the PDF to Canvas.
+
+## Your Analysis {.unnumbered}
+
+::: {.callout-important}
+## Instructions
+Delete this entire section (including the "Do Before Lab" and "Do During Lab" sections above) and replace it with your analysis responses. Use the numbered format below for your final submission.
+:::
+
+**Response 1: Spatial Trend Inconsistencies**
+*What patterns do you observe in the Mann-Kendall results across nearby stations? Are these results climatologically plausible? What does this suggest about single-station trend analysis?*
+
+**Response 2: Nonstationary Model Uncertainty**
+*How does posterior uncertainty in return levels compare across the two nonstationary GEV models? Which model structure provides the most reliable estimates and why?*
+
+**Response 3: Regional vs Single-Station Trade-offs**
+*Compare the bias-variance trade-offs between single-station and regional parameter estimation approaches. Under what conditions would you choose each strategy?*
+
+**Response 4: Parameter Sharing Effects**
+*How does regional parameter sharing affect trend estimates and uncertainty? What are the practical implications for stations with limited data?*
+
+**Response 5: Regional Analysis for PS1**
+*How will these regional analysis techniques enhance your PS1 approach? What challenges do you anticipate in implementing regional models for your selected stations?*
+
+## Data Setup and Package Loading
+
+### Loading Required Packages
+
+We'll load packages for data analysis, Bayesian modeling, and visualization.
+
+```{julia}
+#| output: false
+using Pkg
+lab_dir = dirname(@__FILE__)
+Pkg.activate(lab_dir)
+# Pkg.instantiate() # uncomment this the first time you run the lab to install packages, then comment it back
+```
+
+Load the core packages:
+
+```{julia}
+#| output: false
+using TidierFiles
+using DataFrames
+using Downloads
+using NCDatasets
+using TidierData
+using LinearAlgebra: I
+
+using ArviZ
+using Distributions
+using Optim
+using Random
+using Statistics
+using Turing
+
+using CairoMakie
+using GeoMakie
+using LaTeXStrings
+CairoMakie.activate!(type = "svg")
+
+ENV["DATAFRAMES_ROWS"] = 5
+```
+
+Load utility functions and set random seed:
+
+```{julia}
+#| output: false
+include("util.jl")
+rng = MersenneTwister(543)
+```
+
+
+### Loading Houston Precipitation Data
+
+Use the same Texas precipitation dataset from previous labs:
+
+```{julia}
+#| output: false
+stations, rainfall_data = let
+	precip_fname = joinpath(lab_dir, "dur01d_ams_na14v11.txt")
+	url = "https://hdsc.nws.noaa.gov/pub/hdsc/data/tx/dur01d_ams_na14v11.txt"
+
+	if !isfile(precip_fname)
+		Downloads.download(url, precip_fname)
+	end
+	read_noaa_data(precip_fname)
+end
+```
+
+### Loading CO2 Data
+
+Load global mean CO2 concentrations.
+The data comes from Mauna Loa (1959--2024) and from ice core reconstructions (pre-1959).
+
+```{julia}
+#| output: false
+co2_data = let
+	co2_fname = joinpath(lab_dir, "logCo2.csv")
+	TidierFiles.read_csv(co2_fname) |> DataFrame
+end
+```
+
+Select your primary station that has substantial data and potential trend signal:
+
+```{julia}
+my_stnid = 31  # Station 41-4309 (Houston Addicks), selected for potential trend signal
+my_station = @chain stations begin
+	@filter(stnid == !!my_stnid)
+	first
+end
+my_rainfall = @chain rainfall_data begin
+	@filter(stnid == !!my_stnid)
+	@arrange(date)
+	@full_join(co2_data, "year")  # Join with CO2 data
+	@arrange(year)
+end
+my_rainfall_nomissing = @chain my_rainfall begin
+	@filter(!ismissing(rainfall) && !ismissing(log_CO2))
+end
+
+station_time_series = let
+	fig = Figure(size = (1200, 600))
+
+	# Top plot: Rainfall vs Year
+	ax1 = Axis(fig[1, 1], xlabel = "Year", ylabel = "Annual Max Rainfall (inches)",
+		title = "Annual Maximum Rainfall at $(my_station.name), TX")
+	years = my_rainfall.year
+	rain = ustrip.(u"inch", my_rainfall.rainfall)
+	lines!(ax1, years, rain, color = :blue)
+	scatter!(ax1, years, rain, color = :blue, markersize = 8)
+
+	# Middle plot: CO2 vs Year
+	ax2 = Axis(fig[2, 1], xlabel = "Year", ylabel = "CO₂ Concentration (ppm)",
+		title = "Global Mean CO₂ Concentration")
+	lines!(ax2, years, my_rainfall.log_CO2, color = :red, linewidth = 2)
+
+	# Bottom plot: Rainfall vs log(CO2)
+	ax3 = Axis(fig[1:2, 2], xlabel = "log(CO₂) Concentration", ylabel = "Annual Max Rainfall (inches)",
+		title = "Rainfall vs log(CO₂)")
+	scatter!(ax3, my_rainfall_nomissing.log_CO2, ustrip.(u"inch", my_rainfall_nomissing.rainfall), color = :green, markersize = 8, alpha = 0.7)
+
+	fig
+end
+```
+
+## Spatial Inconsistencies in Single-Station Analysis
+
+One of the key motivations for regional analysis is that individual station analyses often give inconsistent results that aren't climatologically plausible.
+Let's demonstrate this by analyzing trends across nearby stations.
+
+### Finding Regional Stations
+
+First, let's identify stations near our primary station for regional analysis:
+
+```{julia}
+nearby_stations = find_nearest_stations(my_station, stations, 100)
+nearby_stations
+```
+
+### Implementing Trend Tests
+
+We'll implement the Mann-Kendall test, a commonly used non-parametric test for monotonic trends in data, assuming no serial correlation.
+
+```{julia}
+#| output: false
+function mann_kendall_test(x::AbstractVector)
+	"""Mann-Kendall test for monotonic trend detection."""
+	n = length(x)
+
+	# Test statistic: sum of signs of all pairwise differences
+	S = sum(sign(x[j] - x[i]) for i in 1:(n-1) for j in (i+1):n)
+
+	# For n>10, under Null Hypothesis of no trend,
+	# S is Normally distributed with mean 0 and
+	# variance V = (n/18) * (n-1) * (2n+5)
+	var_S = n * (n - 1) * (2n + 5) / 18
+
+	# Standardized test statistic with continuity correction
+	Z = if S > 0
+		(S - 1) / sqrt(var_S)
+	elseif S < 0
+		(S + 1) / sqrt(var_S)
+	else
+		0.0
+	end
+
+	# Two-tailed p-value
+	p_value = 2 * (1 - cdf(Normal(0, 1), abs(Z)))
+
+	return S, p_value
+end
+```
+
+Now apply to our actual data - testing for trends in rainfall with respect to log(CO2):
+
+```{julia}
+prcp_obs = ustrip.(u"inch", my_rainfall_nomissing.rainfall)
+mk_S, mk_p = mann_kendall_test(prcp_obs)
+```
+
+Now let's apply these tests to all nearby stations:
+
+```{julia}
+let
+	stnids = nearby_stations.stnid
+	raw_results = map(stnids) do stnid
+		df = @chain rainfall_data begin
+			@filter(stnid == !!stnid)
+			@filter(!ismissing(rainfall))
+		end
+		prcp = ustrip.(u"inch", df.rainfall)
+		mk_S, mk_p = mann_kendall_test(prcp)
+		return mk_S, mk_p
+	end
+	nearby_stations[!, :mk_S] = getindex.(raw_results, 1)
+	nearby_stations[!, :mk_pvalue] = getindex.(raw_results, 2)
+end
+first(nearby_stations, 3)
+```
+
+### Visualizing Spatial Inconsistencies
+
+Let's create visualizations that show the spatial inconsistency in trend results:
+
+```{julia}
+fig_trends = let
+	fig = Figure(size = (1200, 600))
+
+	# Create 1x2 layout with GeoAxis, each with colorbar to the right
+	ax1 = GeoAxis(fig[1, 1]; source = "+proj=latlong", dest = "+proj=merc",
+		title = "Mann-Kendall S Statistic", xgridvisible = false, ygridvisible = false,
+		xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+	ax2 = GeoAxis(fig[1, 3]; source = "+proj=latlong", dest = "+proj=merc",
+		title = "Mann-Kendall p-values", xgridvisible = false, ygridvisible = false,
+		xticksvisible = false, yticksvisible = false, xticklabelsvisible = false, yticklabelsvisible = false)
+
+	# Add background layers for each axis
+	counties = GeoMakie.naturalearth("admin_2_counties_lakes", 10)
+	for ax in [ax1, ax2]
+		# Add US counties (white with gray borders)
+		poly!(ax, counties.geometry; strokecolor = :lightgray, strokewidth = 1.5, color = :white)
+	end
+
+	# Set Texas extent
+	Δ = 0.5
+	for ax in [ax1, ax2]
+		xlims!(ax, minimum(nearby_stations.longitude) - Δ, maximum(nearby_stations.longitude) + Δ)
+		ylims!(ax, minimum(nearby_stations.latitude) - Δ, maximum(nearby_stations.latitude) + Δ)
+	end
+
+	# Plot data with appropriate colormaps and individual colorbars
+	s1 = scatter!(ax1, nearby_stations.longitude, nearby_stations.latitude,
+		color = nearby_stations.mk_S, colormap = :RdBu, markersize = 18)
+	Colorbar(fig[1, 2], s1, label = "S Statistic")
+
+	s2 = scatter!(ax2, nearby_stations.longitude, nearby_stations.latitude,
+		color = nearby_stations.mk_pvalue, colormap = :viridis, markersize = 18)
+	Colorbar(fig[1, 4], s2, label = "p-value")
+
+	fig
+end
+```
+
+The spatial inconsistency in trend results highlights problems with single-station analysis: nearby stations show contradictory trends that are not climatologically plausible, suggesting that individual station records contain too much noise to reliably detect regional climate signals.
+
+## Single-Station Nonstationary Models
+
+### Understanding Nonstationarity
+
+Traditional extreme value analysis assumes parameters remain constant over time (stationarity). However, climate change may alter the distribution of extreme precipitation. **Nonstationarity** means the statistical properties of extremes change systematically with time or other covariates.
+
+We'll use atmospheric CO₂ concentration as our covariate $x = \log(\text{CO}_2)$ because:
+- CO₂ is a primary driver of global warming
+- Higher temperatures can increase atmospheric moisture capacity
+- This may intensify extreme precipitation events
+
+### Model Specifications
+
+We implement two models that allow different GEV parameters to vary with CO₂:
+
+1. **Location-varying model**: Only the location parameter changes with CO₂
+2. **Location and scale varying model**: Both location and scale parameters change with CO₂
+
+```{julia}
+#| output: false
+@model function nonstationary_gev_model1(y, x)
+	# Model 1: μ(x) = α_μ + β_μ*x where x = log(CO2)
+	α_μ ~ Normal(3.0, 2.0)    # baseline location parameter
+	β_μ ~ Normal(0.0, 2.0)    # location trend parameter (inches per log(ppm))
+	log_σ ~ Normal(0.0, 1.0)  # log-scale parameter
+	ξ ~ Normal(0.0, 0.3)      # shape parameter
+
+	σ = exp(log_σ)
+
+	# Location parameter varies with CO2
+	for i in eachindex(y)
+		x_centered = x[i] - log(380)  # center around ~380 ppm
+		μ_x = α_μ + β_μ * x_centered
+		dist = GeneralizedExtremeValue(μ_x, σ, ξ)
+		y[i] ~ dist
+	end
+end
+
+@model function nonstationary_gev_model2(y, x)
+	# Model 2: μ(x) = α_μ + β_μ*x, σ(x) = α_σ + β_σ*x
+	α_μ ~ Normal(3.0, 2.0)      # baseline location parameter
+	β_μ ~ Normal(0.0, 2.0)      # location trend parameter
+	α_σ ~ LogNormal(0.0, 1.0)   # baseline scale parameter
+	β_σ ~ Normal(0.0, 0.2)      # scale trend parameter (small prior)
+	ξ ~ Normal(0.0, 0.3)        # shape parameter
+
+	for i in eachindex(y)
+		x_centered = x[i] - log(380)
+		μ_x = α_μ + β_μ * x_centered
+		σ_x = α_σ + β_σ * x_centered
+
+		# Ensure positive scale parameter
+		if σ_x > 0.1
+			dist = GeneralizedExtremeValue(μ_x, σ_x, ξ)
+			y[i] ~ dist
+		else
+			Turing.@addlogprob!(-Inf)
+		end
+	end
+end
+
+```
+
+### Model Fitting and Diagnostics
+
+Let's fit these models to our primary station:
+
+```{julia}
+#| output: false
+# Prepare data
+y_obs = ustrip.(u"inch", my_rainfall_nomissing.rainfall)
+x_obs = my_rainfall_nomissing.log_CO2  # x = log(CO2)
+
+# Fit the two models
+models = [
+	("Location trend", nonstationary_gev_model1(y_obs, x_obs)),
+	("Location + Scale trends", nonstationary_gev_model2(y_obs, x_obs)),
+]
+
+# Sample from posteriors and check diagnostics
+posterior_results = []
+for (name, model) in models
+	fname = joinpath(lab_dir, "nonstat_$(replace(name, " " => "_")).nc")
+	overwrite = false
+	idata = load_or_sample(fname, model; overwrite = overwrite, samples_per_chain = 1000)
+	push!(posterior_results, (name = name, idata = idata))
+
+	# Check diagnostics immediately after fitting
+	println("=== Diagnostics for $name ===")
+	display(ArviZ.summarize(idata))
+end
+```
+
+Create traceplots to visualize MCMC chain behavior for key parameters:
+
+```{julia}
+# Traceplots for Model 1
+model1_traceplots = let
+	fig = Figure(size = (1200, 600))
+	param_names = [:α_μ, :β_μ, :log_σ, :ξ]
+
+	for (i, param) in enumerate(param_names)
+		ax = Axis(fig[i, 1], xlabel = i == length(param_names) ? "Iteration" : "",
+			ylabel = string(param), title = i == 1 ? "Model 1 (Location Trend)" : "")
+		traceplot!(ax, posterior_results[1].idata, param)
+	end
+
+	fig
+end
+```
+
+```{julia}
+# Traceplots for Model 2
+model2_traceplots = let
+	fig = Figure(size = (1200, 800))
+	param_names = [:α_μ, :β_μ, :α_σ, :β_σ, :ξ]
+
+	for (i, param) in enumerate(param_names)
+		ax = Axis(fig[i, 1], xlabel = i == length(param_names) ? "Iteration" : "",
+			ylabel = string(param), title = i == 1 ? "Model 2 (Location + Scale Trends)" : "")
+		traceplot!(ax, posterior_results[2].idata, param)
+	end
+
+	fig
+end
+```
+
+Check convergence: effective sample size should exceed 400, R-hat should be near 1.0, and traceplots should show good mixing across chains.
+
+### Extracting GEV Distributions
+
+First, let's define functions to extract GEV distributions for any year across our two nonstationary models:
+
+```{julia}
+#| output: false
+# Model 1: Location trend only
+function extract_model1_gevs(idata, x)
+	x_centered = x - log(380)  # center around ~380 ppm
+	α_μ = Array(idata.posterior[:α_μ])
+	β_μ = Array(idata.posterior[:β_μ])
+	σ = exp.(Array(idata.posterior[:log_σ]))
+	ξ = Array(idata.posterior[:ξ])
+	μ_x = α_μ .+ β_μ .* x_centered
+	vec(GeneralizedExtremeValue.(μ_x, σ, ξ))
+end
+
+# Model 2: Location + Scale trends
+function extract_model2_gevs(idata, x)
+	x_centered = x - log(380)
+	α_μ = Array(idata.posterior[:α_μ])
+	β_μ = Array(idata.posterior[:β_μ])
+	α_σ = Array(idata.posterior[:α_σ])
+	β_σ = Array(idata.posterior[:β_σ])
+	ξ = Array(idata.posterior[:ξ])
+	μ_x = α_μ .+ β_μ .* x_centered
+	σ_x = α_σ .+ β_σ .* x_centered
+	# Filter out negative scale parameters
+	valid = σ_x .> 0.1
+	vec(GeneralizedExtremeValue.(μ_x[valid], σ_x[valid], ξ[valid]))
+end
+
+```
+
+Now extract GEV distributions for both 1950 and 2025 using appropriate CO2 levels:
+
+```{julia}
+#| output: false
+# Extract data for each model
+model1_name, model1_idata = posterior_results[1].name, posterior_results[1].idata
+model2_name, model2_idata = posterior_results[2].name, posterior_results[2].idata
+
+# Approximate CO2 levels (x = log(CO2))
+x_1950 = co2_data.log_CO2[co2_data.year.==1950][1]  # ~310 ppm in 1950
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]  # ~425 ppm projected for 2025
+
+# Extract GEV distributions for both time periods
+gevs_1950 = [
+	extract_model1_gevs(model1_idata, x_1950),
+	extract_model2_gevs(model2_idata, x_1950),
+]
+
+gevs_2025 = [
+	extract_model1_gevs(model1_idata, x_2025),
+	extract_model2_gevs(model2_idata, x_2025),
+]
+```
+
+### Model Comparison and Uncertainty
+
+```{julia}
+# Create comprehensive comparison: 1950 vs 2025 across both models
+fig_comprehensive = let
+	fig = Figure(size = (1000, 700))
+
+	rts = logrange(1.1, 250, 100)
+	xticks = [2, 5, 10, 25, 50, 100, 250]
+
+	# Top row: 1950 vs 2025 comparison for each model (adjust column widths)
+	ax1 = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "Location Trend Model", xscale = log10, xticks = xticks)
+	ax2 = Axis(fig[1, 2], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "Location + Scale Trends Model", xscale = log10, xticks = xticks)
+
+	# Make columns equal width
+	colsize!(fig.layout, 1, Relative(0.5))
+	colsize!(fig.layout, 2, Relative(0.5))
+
+	top_axes = [ax1, ax2]
+
+	for (i, (ax, gevs_50, gevs_25)) in enumerate(zip(top_axes, gevs_1950, gevs_2025))
+		posterior_bands!(ax, gevs_50, rts; ci = 0.90, color = (:blue, 0.3))
+		posterior_mean_curve!(ax, gevs_50, rts; color = :blue, linewidth = 2, label = "1950")
+		posterior_bands!(ax, gevs_25, rts; ci = 0.90, color = (:red, 0.3))
+		posterior_mean_curve!(ax, gevs_25, rts; color = :red, linewidth = 2, label = "2025")
+		if i == 1
+			axislegend(ax, position = :rb)
+		end
+	end
+
+	# Bottom: Direct model comparison for 2025
+	ax3 = Axis(fig[2, 1:2], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "Model Comparison for 2025 (Note: Models Show Similar Behavior)",
+		xscale = log10, xticks = xticks)
+
+	colors = [:blue, :red]
+	labels = ["Location Trend", "Location + Scale"]
+
+	for (i, (gevs, color, label)) in enumerate(zip(gevs_2025, colors, labels))
+		posterior_bands!(ax3, gevs, rts; ci = 0.68, color = (color, 0.3))
+		posterior_mean_curve!(ax3, gevs, rts; color = color, linewidth = 2, label = label)
+	end
+
+	axislegend(ax3, position = :lt)
+	linkyaxes!(top_axes...)
+
+	fig
+end
+```
+
+The two models show remarkably similar behavior, which is actually quite interesting - it suggests that for this dataset, allowing the scale parameter to vary with CO₂ doesn't dramatically change the return level projections. Let's examine the 100-year return period distributions more closely:
+
+```{julia}
+fig_rl100_comparison = let
+	fig = Figure(size = (800, 400))
+
+	titles = ["Location Trend", "Location + Scale"]
+
+	for i in 1:2
+		ax = Axis(fig[1, i], xlabel = "100-year RL (inches)", ylabel = "Count", title = titles[i])
+
+		# Calculate 100-year return levels
+		rl_1950 = [quantile(gev, 0.99) for gev in gevs_1950[i]]
+		rl_2025 = [quantile(gev, 0.99) for gev in gevs_2025[i]]
+
+		# Plot histograms
+		hist!(ax, rl_1950, bins = 25, color = (:purple, 0.5), label = "1950")
+		hist!(ax, rl_2025, bins = 25, color = (:orange, 0.5), label = "2025")
+
+		i == 1 && axislegend(ax, position = :rt)
+	end
+
+	fig
+end
+```
+
+
+The large posterior uncertainties in single-station models, particularly for return level projections, indicate that individual stations lack sufficient data to reliably estimate trends in extreme precipitation.
+
+## Regional Parameter Estimation
+
+The large uncertainties in single-station analyses motivate regional approaches.
+Let's implement a regional model where some parameters are shared across stations while others remain station-specific.
+
+### Regional Model Design
+
+Our regional GEV model uses a simple approach where some parameters are shared regionally while others vary by station.
+
+For station $i$ in year $t$:
+
+$$Y_{i,t} \sim \text{GEV}(\mu_{i,t}, \sigma_i, \xi_{\text{region}})$$
+
+where:
+
+- **Regional parameters**: $\beta_{\text{region}}$ (trend) and $\xi_{\text{region}}$ (shape) are the same for all stations
+- **Station-specific parameters**: $\alpha_{\mu,i}$ (baseline location) and $\sigma_i$ (scale) differ by station
+
+The location parameter varies with our covariate $x = \log(\text{CO}_2)$:
+$$\mu_{i,t} = \alpha_{\mu,i} + \beta_{\text{region}} \cdot (x_t - \log(380))$$
+
+This approach assumes climate change affects trend and extreme value tail behavior similarly across the region, while allowing for local differences in baseline precipitation amounts and variability.
+
+We'll select the 8 closest stations with at least 40 years of data
+
+```{julia}
+#| output: false
+analysis_stations = let
+	lon = my_station.longitude
+	lat = my_station.latitude
+	@chain nearby_stations begin
+		@filter(years_of_data >= 40)
+		@mutate(distance = calc_distance(!!lat, !!lon, latitude, longitude))
+		@arrange(distance)
+		first(8)
+	end
+end
+analysis_stnids = analysis_stations.stnid
+```
+
+To analyze the data, we're going to converte it to a matrix, where each row corresponds to a year and each column corresponds to a station.
+
+```{julia}
+#| output: false
+years_vec, rainfall_matrix = let
+	rainfall_matrix_data = @chain rainfall_data begin
+		@filter(in(stnid, !!analysis_stnids))
+		@mutate(rainfall_inch = ifelse(ismissing(rainfall), missing, ustrip(u"inch", rainfall)))
+		@select(year, stnid, rainfall_inch)
+		@pivot_wider(names_from = stnid, values_from = rainfall_inch)
+		@arrange(year)
+	end
+	years = rainfall_matrix_data.year
+	matrix = Matrix(rainfall_matrix_data[:, 2:end])
+	years, matrix
+end
+```
+
+### Data Preparation
+
+First, prepare the data matrices for our hierarchical analysis:
+
+```{julia}
+#| output: false
+# Prepare matrices for regional model
+y_matrix, x_vector = let
+	# Get rainfall matrix: [year, station]
+	rainfall_wide = @chain rainfall_data begin
+		@filter(in(stnid, !!analysis_stnids))
+		@mutate(rainfall_inch = ustrip(u"inch", rainfall))
+		@select(year, stnid, rainfall_inch)
+		@pivot_wider(names_from = stnid, values_from = rainfall_inch)
+		@arrange(year)
+	end
+
+	# Extract years and matrix
+	years = rainfall_wide.year
+	y_mat = Matrix(rainfall_wide[:, 2:end])  # Drop year column
+
+	# Get x vector (log CO2) for the same years
+	x_vec = @chain co2_data begin
+		@filter(in(year, !!years))
+		@arrange(year)
+		@select(log_CO2)
+	end
+
+	y_mat, x_vec.log_CO2
+end
+```
+
+### Regional Model Implementation
+
+Now implement our simplified regional model:
+
+```{julia}
+#| output: false
+@model function regional_nonstationary_gev(y_matrix, x_vector)
+
+	n_years, n_stations = size(y_matrix)
+
+	# Regional parameters (shared across all stations)
+	β_region ~ Normal(0.0, 2.0)          # Regional trend (inches per log(ppm))
+	ξ_region ~ Normal(0.0, 0.2)          # Regional shape parameter
+
+	# Station-specific parameters (independent for each station)
+	α_μ_stations ~ MvNormal(fill(3.0, n_stations), I * 2.0)  # Baseline location for each station
+	log_σ_stations ~ MvNormal(zeros(n_stations), I * 0.5)    # Scale parameter for each station
+
+	σ_stations = exp.(log_σ_stations)
+
+	# Data likelihood - loop over matrix, skip missing values
+	for i in 1:n_years
+		x_centered = x_vector[i] - log(380)  # Center x around ~380 ppm CO2
+		for j in 1:n_stations
+			if !ismissing(y_matrix[i, j])
+				μ_ij = α_μ_stations[j] + β_region * x_centered
+				dist = GeneralizedExtremeValue(μ_ij, σ_stations[j], ξ_region)
+				y_matrix[i, j] ~ dist
+			end
+		end
+	end
+end
+
+# Fit regional model with diagnostics
+regional_idata = let
+	regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+	regional_model = regional_nonstationary_gev(y_matrix, x_vector)
+	overwrite = false
+	idata = load_or_sample(regional_fname, regional_model; overwrite = overwrite, samples_per_chain = 1500)
+
+	# Check diagnostics immediately after fitting
+	println("=== Regional Model Diagnostics ===")
+	display(ArviZ.summarize(idata))
+
+	idata
+end
+```
+
+```{julia}
+# Traceplots for regional parameters
+regional_traceplots = let
+	fig = Figure(size = (1200, 400))
+	param_names = [:β_region, :ξ_region]
+
+	for (i, param) in enumerate(param_names)
+		ax = Axis(fig[i, 1], xlabel = i == length(param_names) ? "Iteration" : "",
+			ylabel = string(param), title = i == 1 ? "Regional Model Parameters" : "")
+		traceplot!(ax, regional_idata, param)
+	end
+
+	fig
+end
+```
+
+This takes about a minute on my laptop, but may take longer on your machine.
+Using `overwrite=false` is helpful - you can run it once and then load the results later without re-running the sampling.
+
+## Comparing Regional vs Single-Station Approaches
+
+Let's compare how the regional model performs versus the single-station nonstationary models for our primary station.
+
+```{julia}
+# Extract regional model results for our primary station
+# Re-load necessary variables for proper scoping
+regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+regional_idata = ArviZ.from_netcdf(regional_fname)
+
+my_stnid = 31
+analysis_stnids = analysis_stations.stnid
+
+my_station_idx = findfirst(x -> x == my_stnid, analysis_stnids)
+regional_my_station = let
+	# Extract regional parameters (shared)
+	β_samples = vec(Array(regional_idata.posterior[:β_region]))
+	ξ_samples = vec(Array(regional_idata.posterior[:ξ_region]))
+
+	# Extract station-specific parameters for our station
+	α_μ_samples = vec(Array(regional_idata.posterior[:α_μ_stations])[:, :, my_station_idx])
+	σ_samples = exp.(vec(Array(regional_idata.posterior[:log_σ_stations])[:, :, my_station_idx]))
+
+	(α_μ = α_μ_samples, β_μ = β_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Extract single-station model results (Model 1: Location trend only)
+single_station = let
+	model1_idata = posterior_results[1].idata
+	α_μ_samples = vec(Array(model1_idata.posterior[:α_μ]))
+	β_μ_samples = vec(Array(model1_idata.posterior[:β_μ]))
+	σ_samples = exp.(vec(Array(model1_idata.posterior[:log_σ])))
+	ξ_samples = vec(Array(model1_idata.posterior[:ξ]))
+
+	(α_μ = α_μ_samples, β_μ = β_μ_samples, σ = σ_samples, ξ = ξ_samples)
+end
+
+# Prepare data for comparison plots
+rts = logrange(1.1, 250, 100)
+xticks = [2, 5, 10, 25, 50, 100, 250]
+x_2025 = co2_data.log_CO2[co2_data.year.==2024][1]
+x_centered = x_2025 - log(380)
+
+# Create GEV distributions for 2025
+μ_single_2025 = single_station.α_μ .+ single_station.β_μ .* x_centered
+gevs_single = GeneralizedExtremeValue.(μ_single_2025, single_station.σ, single_station.ξ)
+
+μ_regional_2025 = regional_my_station.α_μ .+ regional_my_station.β_μ .* x_centered
+gevs_regional = GeneralizedExtremeValue.(μ_regional_2025, regional_my_station.σ, regional_my_station.ξ)
+```
+
+### Return Level Curves
+
+```{julia}
+# Return level curves comparison
+return_level_fig = let
+	fig = Figure(size = (800, 500))
+
+	ax = Axis(fig[1, 1], xlabel = "Return Period (years)", ylabel = "Return Level (inches)",
+		title = "2025 Return Level Comparison: Single-Station vs Regional",
+		xscale = log10, xticks = xticks)
+
+	# Plot uncertainty bands and mean curves
+	posterior_bands!(ax, gevs_single, rts; ci = 0.90, color = (:blue, 0.3))
+	posterior_mean_curve!(ax, gevs_single, rts; color = :blue, linewidth = 3, label = "Single-Station")
+
+	posterior_bands!(ax, gevs_regional, rts; ci = 0.90, color = (:red, 0.3))
+	posterior_mean_curve!(ax, gevs_regional, rts; color = :red, linewidth = 3, label = "Regional")
+
+	axislegend(ax, position = :rb)
+
+	fig
+end
+```
+
+### Parameter Uncertainty
+
+```{julia}
+# Parameter uncertainty comparison
+parameter_uncertainty_fig = let
+	fig = Figure(size = (800, 400))
+
+	ax = Axis(fig[1, 1], xlabel = "Parameter", ylabel = "Posterior Standard Deviation",
+		title = "Parameter Uncertainty: Single-Station vs Regional")
+
+	params = [L"$\alpha_\mu$", L"$\beta_\mu$", L"$\sigma$", L"$\xi$"]
+	single_stds = [
+		std(single_station.α_μ),
+		std(single_station.β_μ),
+		std(single_station.σ),
+		std(single_station.ξ),
+	]
+	regional_stds = [
+		std(regional_my_station.α_μ),
+		std(regional_my_station.β_μ),
+		std(regional_my_station.σ),
+		std(regional_my_station.ξ),
+	]
+
+	x_pos = 1:length(params)
+	barplot!(ax, x_pos .- 0.2, single_stds, width = 0.35, color = :blue, alpha = 0.7, label = "Single-Station")
+	barplot!(ax, x_pos .+ 0.2, regional_stds, width = 0.35, color = :red, alpha = 0.7, label = "Regional")
+
+	ax.xticks = (x_pos, params)
+	axislegend(ax, position = :rt)
+
+	fig
+end
+```
+
+### Return Level Distributions
+
+```{julia}
+# 100-year return level distributions
+return_level_dist_fig = let
+	fig = Figure(size = (800, 400))
+
+	ax = Axis(fig[1, 1], xlabel = "100-year Return Level (inches)", ylabel = "Density",
+		title = "100-year Return Level Uncertainty")
+
+	# Calculate 100-year return levels
+	rl100_single = [quantile(gev, 0.99) for gev in gevs_single]
+	rl100_regional = [quantile(gev, 0.99) for gev in gevs_regional]
+
+	hist!(ax, rl100_single, bins = 30, color = (:blue, 0.5), label = "Single-Station", normalization = :pdf)
+	hist!(ax, rl100_regional, bins = 30, color = (:red, 0.5), label = "Regional", normalization = :pdf)
+
+	axislegend(ax, position = :rt)
+
+	fig
+end
+```
+
+
+### Trend Parameter Analysis
+
+Let's examine how trend estimates compare between the single-station and regional approaches:
+
+```{julia}
+# Compare trend estimates from single-station vs regional models
+trend_comparison_fig = let
+	fig = Figure(size = (1000, 400))
+
+	# Re-extract needed variables for proper scoping
+	single_idata = posterior_results[1].idata
+	regional_fname = joinpath(lab_dir, "regional_nonstat.nc")
+	regional_idata = ArviZ.from_netcdf(regional_fname)
+
+	# Extract trend parameters
+	single_β_μ = vec(Array(single_idata.posterior[:β_μ]))
+	regional_β_μ = vec(Array(regional_idata.posterior[:β_region]))
+
+	# Left plot: trend parameter distributions
+	ax1 = Axis(fig[1, 1], xlabel = L"Location Trend Parameter $\beta_\mu$ (inches per log(ppm))", ylabel = "Density",
+		title = "Trend Parameter Estimates")
+
+	hist!(ax1, single_β_μ, bins = 30, color = (:blue, 0.5), label = "Single-Station", normalization = :pdf)
+	hist!(ax1, regional_β_μ, bins = 30, color = (:red, 0.5), label = "Regional", normalization = :pdf)
+
+	axislegend(ax1, position = :rt)
+
+	# Right plot: uncertainty comparison
+	ax2 = Axis(fig[1, 2], xlabel = "Model", ylabel = "Standard Deviation",
+		title = "Trend Parameter Uncertainty")
+
+	trend_stds = [std(single_β_μ), std(regional_β_μ)]
+	barplot!(ax2, 1:2, trend_stds, color = [:blue, :red], alpha = 0.7)
+	ax2.xticks = (1:2, ["Single-Station", "Regional"])
+
+	# Add text labels on bars
+	for (i, val) in enumerate(trend_stds)
+		text!(ax2, i, val - 0.25, text = string(round(val, digits = 2)),
+			align = (:center, :bottom), color = :white, fontsize = 16)
+	end
+
+	fig
+end
+```
+
+The regional approach appears to provide a somewhat more precise estimate of the trend parameter, even though we didn't explicitly pool the trend parameter across stations. 
+This improved precision occurs because by pooling the shape parameter and constraining the station-specific parameters, we get better estimates of the other model components, which in turn help constrain our trend estimate.
+This demonstrates how regional modeling can sharpen parameter estimates through better overall model specification.
+
+## Wrapup
+
+This lab demonstrates several key concepts essential for PS1:
+
+1. Extremes are noisy and random. Trend tests and nonstationary model inferences conducted at individual stations can be implausible and inconsistent across nearby stations.
+2. Just because we don't unambiguously detect a trend at a single station doesn't mean we should assume that no trend exists.
+3. Regional models provide a straightforward way to share information across stations while preserving local differences
+4. Regionalization can improve parameter estimates and reduce uncertainty, even for parameters that aren't explicitly pooled.
